@@ -1,26 +1,33 @@
-# 🧠 Synapse: Memory Engine for LLMs
+# Synapse: Long-term Memory for LLMs
 
-**Synapse** is a hybrid memory engine designed to extend LLM intelligence with structured, indexed, and versioned long-term memory. It replaces raw history injection with a semantic search system (BM25 + Recency) ensuring high relevance and low token costs.
+Synapse is a lightweight memory engine designed to give agents and LLMs a permanent "brain." It solves the "goldfish memory" problem by storing important facts, decisions, and preferences in an organized way, retrieving only what is relevant to the current conversation.
 
-Available as both a **Model Context Protocol (MCP)** server and a standalone **CLI Engine**.
-
----
-
-## ✨ Features
-- **Hybrid Architecture**: Works as a plug-and-play MCP tool for Claude/Cursor or a background script.
-- **Smart Scoring**: Uses BM25 crossed with Time Decay (Recency) to find what truly matters *now*.
-- **Auto-Fragmentation**: Automatically splits large memories into chunks to fit context windows.
-- **Deterministic & Fast**: SQLite persistence with an In-Memory RAM Index for <500ms lookups.
-- **Zero-Dependency Core**: Pure Python 3 core engine.
+Instead of stuffing your entire chat history into a prompt, Synapse uses a smart search system to find exactly what matters. This keeps your context window clean and your token costs low.
 
 ---
 
-## 🚀 Getting Started
+## How it works
+
+Synapse is designed to be flexible and works in two main ways:
+
+* **Plug-and-play (MCP)**: Connect it to any AI tool that supports the Model Context Protocol (such as Claude Desktop, Cursor, Zed, and others). It works instantly as a set of tools the AI can use to remember things about your projects and preferences.
+* **As a Core Engine**: If you are building your own AI application, you can import Synapse directly into your Python project. It handles memory management, semantic search, and versioning without the need for complex vector database setups.
+
+## Main Features
+
+* **Smart Retrieval**: It doesn't just look for keywords. It combines relevance (BM25) with recency, meaning it prioritizes what you decided today over information from months ago.
+* **Automatic Organization**: It manages hierarchical categories and automatically fragments long pieces of information to fit within LLM context limits.
+* **Fast and Reliable**: Built on SQLite with an in-memory index, it retrieves memories in less than 500ms.
+* **Zero Dependencies**: Written in pure Python 3 to be lightweight, easy to audit, and simple to integrate.
+
+---
+
+## Getting Started
 
 ### Prerequisites
-- Python 3.10+
+* Python 3.10+
 
-### 1. Initial Setup
+### 1. Installation
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/synapse.git
@@ -30,11 +37,12 @@ cd synapse
 python3 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
+# Install dependencies (only required for the MCP server)
 pip install -r requirements.txt
 ```
 
-### 2. Standalone CLI Usage (Manual Control)
+### 2. Standalone CLI Usage
+You can manage your memory manually via the terminal:
 ```bash
 # Initialize the database
 python3 -m synapse init
@@ -46,10 +54,10 @@ python3 -m synapse add --path "project/stack" --title "Database" --content "Usin
 python3 -m synapse search --prompt "what database are we using?"
 ```
 
-### 3. MCP Server (For AI Assistants)
-Connect Synapse to **Claude Desktop**, **Cursor**, or any MCP-compatible agent to give it permanent memory.
+### 3. MCP Server Configuration
+To use Synapse with tools like Claude Desktop or Cursor, add it to your configuration file:
 
-**Claude Desktop Configuration (`claude_desktop_config.json`):**
+**Example (`claude_desktop_config.json`):**
 ```json
 {
   "mcpServers": {
@@ -66,30 +74,22 @@ Connect Synapse to **Claude Desktop**, **Cursor**, or any MCP-compatible agent t
 
 ---
 
-## 🛠 Available Tools (via MCP)
-- `search_memory`: Semantic and temporal search of facts.
-- `store_memory`: Saves new facts with automatic category-based organization.
-- `update_memory`: Updates existing facts, maintaining version history.
-- `forget_memory`: Privacy tool to wipe specific categories.
+## Maintenance
+Keep your memory engine healthy with built-in maintenance tools:
 
----
-
-## 🧹 Maintenance (CLI)
-Keep your memory engine healthy with background tasks:
 ```bash
-# Run Garbage Collector (obsoslescence and cleanup)
+# Run Garbage Collector (clean up obsolete data)
 python3 -m synapse gc
 
 # Database and Index optimization
 python3 -m synapse optimize
 ```
 
-## 🧪 Testing
+## Testing
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
----
-
-## 📄 License
+## License
 MIT. See `LICENSE` for details.
+
