@@ -39,11 +39,16 @@ def run_gc(
         cleaned_mem_locks = _cleanup_locks(conn, table="memory_lock", now=now)
         cleaned_op_locks = _cleanup_locks(conn, table="op_lock", now=now)
 
+    merged_entities = 0
+    if config.get("kg_extraction_enabled"):
+        merged_entities = _merge_entities(conn, config, now=now)
+
     return {
         "marked_obsolete": int(marked or 0),
         "deleted": int(deleted or 0),
         "cleaned_memory_locks": int(cleaned_mem_locks),
         "cleaned_op_locks": int(cleaned_op_locks),
+        "merged_entities": merged_entities,
     }
 
 
@@ -92,4 +97,64 @@ def _cleanup_locks(conn: sqlite3.Connection, *, table: str, now: datetime) -> in
     else:
         raise ValueError("unknown lock table")
     return int(res.rowcount or 0)
+
+
+def _merge_entities(conn: sqlite3.Connection, config: dict[str, Any], *, now: datetime) -> int:
+    try:
+        from sentence_transformers import SentenceTransformer, util
+    except ImportError:
+        # Not installed, bypass for now.
+        return 0
+
+    threshold = float(config.get("kg_auto_merge_threshold", 0.92))
+    
+    with conn:
+        rows = conn.execute("SELECT id, name FROM entities ORDER BY created_at ASC;").fetchall()
+        
+    if len(rows) < 2:
+        return 0
+
+    entities = [{"id": r["id"], "name": r["name"]} for r in rows]
+    names = [e["name"] for e in entities]
+    
+    # Lazy load the tiny embedding model
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(names, convert_to_tensor=True)
+    cosine_scores = util.cos_sim(embeddings, embeddings)
+    
+    merged_count = 0
+    merged_ids = set()
+    
+    with conn:
+        for i in range(len(entities)):
+            if entities[i]["id"] in merged_ids:
+                continue
+            for j in range(i + 1, len(entities)):
+                if entities[j]["id"] in merged_ids:
+                    continue
+                if cosine_scores[i][j].item() > threshold:
+                    # Merge newer (j) into older (i)
+                    target_id = entities[i]["id"]
+                    source_id = entities[j]["id"]
+                    
+                    # Update relations
+                    conn.execute("UPDATE relations SET source_id=? WHERE source_id=?;", (target_id, source_id))
+                    conn.execute("UPDATE relations SET target_id=? WHERE target_id=?;", (target_id, source_id))
+                    
+                    # Update observations
+                    conn.execute("UPDATE observations SET entity_id=? WHERE entity_id=?;", (target_id, source_id))
+                    
+                    # Document synonym
+                    target_desc = conn.execute("SELECT description FROM entities WHERE id=?;", (target_id,)).fetchone()["description"] or ""
+                    source_name = entities[j]["name"]
+                    new_desc = target_desc + f" [Merged Synonym: {source_name}]"
+                    conn.execute("UPDATE entities SET description=?, updated_at=? WHERE id=?;", (new_desc.strip(), isoformat_z(now), target_id))
+                    
+                    # Delete obsolete entity
+                    conn.execute("DELETE FROM entities WHERE id=?;", (source_id,))
+                    
+                    merged_ids.add(source_id)
+                    merged_count += 1
+                    
+    return merged_count
 

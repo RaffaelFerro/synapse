@@ -5,7 +5,7 @@ from typing import Any
 
 from .util import json_dumps, json_loads
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DEFAULT_DB_PATH = "synapse.db"
 
@@ -24,6 +24,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "obsolete_penalty": 0.5,
     "anonymous_mode": False,
     "debug_mode_default": False,
+    "kg_extraction_enabled": True,
+    "kg_auto_merge_threshold": 0.92,
     # Scoring / performance knobs (protótipo)
     "bm25_k1": 1.2,
     "bm25_b": 0.75,
@@ -125,6 +127,74 @@ def init_db(conn: sqlite3.Connection) -> None:
               locked_at TEXT NOT NULL,
               lock_owner TEXT NOT NULL
             );
+
+            -- Knowledge Graph Tables
+            CREATE TABLE IF NOT EXISTS entities (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              type TEXT,
+              description TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS entities_name_idx ON entities(name);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(id UNINDEXED, name);
+
+            CREATE TRIGGER IF NOT EXISTS entities_fts_insert AFTER INSERT ON entities BEGIN
+                INSERT INTO entities_fts(rowid, id, name) VALUES (new.rowid, new.id, new.name);
+            END;
+            
+            CREATE TRIGGER IF NOT EXISTS entities_fts_delete AFTER DELETE ON entities BEGIN
+                INSERT INTO entities_fts(entities_fts, rowid, id, name) VALUES('delete', old.rowid, old.id, old.name);
+            END;
+            
+            CREATE TRIGGER IF NOT EXISTS entities_fts_update AFTER UPDATE ON entities BEGIN
+                INSERT INTO entities_fts(entities_fts, rowid, id, name) VALUES('delete', old.rowid, old.id, old.name);
+                INSERT INTO entities_fts(rowid, id, name) VALUES (new.rowid, new.id, new.name);
+            END;
+
+            CREATE TABLE IF NOT EXISTS relations (
+              id TEXT PRIMARY KEY,
+              source_id TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              relation_type TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(source_id) REFERENCES entities(id) ON DELETE CASCADE,
+              FOREIGN KEY(target_id) REFERENCES entities(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS relations_source_idx ON relations(source_id);
+            CREATE INDEX IF NOT EXISTS relations_target_idx ON relations(target_id);
+
+            CREATE TABLE IF NOT EXISTS observations (
+              id TEXT PRIMARY KEY,
+              entity_id TEXT,
+              relation_id TEXT,
+              content TEXT NOT NULL,
+              memory_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+              FOREIGN KEY(relation_id) REFERENCES relations(id) ON DELETE CASCADE,
+              FOREIGN KEY(memory_id) REFERENCES memory(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS obs_entity_idx ON observations(entity_id);
+            CREATE INDEX IF NOT EXISTS obs_relation_idx ON observations(relation_id);
+            CREATE INDEX IF NOT EXISTS obs_memory_idx ON observations(memory_id);
+
+            CREATE TABLE IF NOT EXISTS indexing_jobs (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending','processing','completed','failed')),
+                attempts INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(memory_id) REFERENCES memory(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS indexing_jobs_status_idx ON indexing_jobs(status);
             """
         )
 

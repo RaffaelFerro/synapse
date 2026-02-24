@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from . import db as db_mod
@@ -109,6 +112,9 @@ class SynapseEngine:
                 now=now,
             )
 
+        if self.config.get("kg_extraction_enabled"):
+            self._queue_extraction_job(mem_id, now)
+
         if rebuild_index:
             self.rebuild_index()
         return mem_id
@@ -195,6 +201,10 @@ class SynapseEngine:
                     )
 
                 self._enforce_version_limit(memory_id)
+            
+            if self.config.get("kg_extraction_enabled"):
+                self._queue_extraction_job(memory_id, now)
+
         finally:
             if owner is not None:
                 release_memory_lock(self.conn, memory_id, owner)
@@ -280,6 +290,14 @@ class SynapseEngine:
         )
         t_ctx = t0.ms()
 
+        kg_data = self._query_knowledge_graph(prompt)
+        if kg_data:
+            context_obj["knowledge_graph"] = kg_data
+            if "search_terms" in kg_data:
+                # Optionally add these terms to debug output
+                pass
+        t_kg = t0.ms()
+
         if (not self.is_anonymous()) and selected_ids:
             self._touch_used(selected_ids, now=now)
             # mantém o índice coerente para recency do próximo search
@@ -301,9 +319,102 @@ class SynapseEngine:
             "extract_terms": t_terms,
             "scoring": t_score - t_terms,
             "context": t_ctx - t_score,
-            "total": t_ctx,
+            "kg_query": t_kg - t_ctx,
+            "total": t_kg,
         }
         return SearchResult(context=context_obj, selected_ids=selected_ids, timings_ms=timings)
+
+    def _query_knowledge_graph(self, prompt: str) -> dict[str, Any]:
+        if not self.config.get("kg_extraction_enabled"):
+            return {}
+            
+        kg_context = {"triples": [], "observations": [], "search_terms": []}
+        
+        # Fast Path: Check if prompt directly hits FTS5 entities
+        def escape_fts(text):
+            return '"' + text.replace('"', '""') + '"'
+            
+        ent_ids = []
+        search_terms = []
+        
+        with self.conn:
+            clean_prompt = re.sub(r'[^\w\s]', ' ', prompt).strip()
+            if clean_prompt:
+                words = clean_prompt.split()
+                if words:
+                    match_expr = " OR ".join([escape_fts(w) for w in words])
+                    try:
+                        fts_query = "SELECT id, name FROM entities_fts WHERE name MATCH ?"
+                        rows = self.conn.execute(fts_query, (match_expr,)).fetchall()
+                        for r in rows:
+                            if r["name"].lower() in prompt.lower():
+                                ent_ids.append(r["id"])
+                                search_terms.append(r["name"])
+                    except sqlite3.OperationalError:
+                        pass
+        
+        # If no fast-path match, try LLM interpretation
+        if not ent_ids:
+            sys_prompt = self._load_prompt("interpret_search.txt")
+            llm = get_llm_client()
+            raw_res = llm.chat_completion(sys_prompt, prompt)
+            if not raw_res:
+                return {}
+                
+            import json
+            try:
+                data = json.loads(raw_res)
+                search_terms = data.get("search_terms", [])
+            except json.JSONDecodeError:
+                return {}
+                
+            if not search_terms:
+                return {}
+                
+            with self.conn:
+                query = "SELECT id, name FROM entities WHERE " + " OR ".join(["name LIKE ?" for _ in search_terms])
+                params = [f"%{t}%" for t in search_terms]
+                ent_rows = self.conn.execute(query, params).fetchall()
+                if not ent_rows:
+                    return {"triples": [], "observations": [], "search_terms": search_terms}
+                ent_ids = [r["id"] for r in ent_rows]
+                
+        kg_context["search_terms"] = list(search_terms)
+        
+        with self.conn:
+            placeholders_ent = ",".join(["?"] * len(ent_ids))
+            rel_query = f"""
+                SELECT r.id, r.source_id, r.target_id, r.relation_type, 
+                       e1.name as source_name, e2.name as target_name
+                FROM relations r
+                JOIN entities e1 ON r.source_id = e1.id
+                JOIN entities e2 ON r.target_id = e2.id
+                WHERE r.source_id IN ({placeholders_ent}) OR r.target_id IN ({placeholders_ent})
+            """
+            rel_rows = self.conn.execute(rel_query, ent_ids + ent_ids).fetchall()
+            rel_ids = []
+            for r in rel_rows:
+                rel_ids.append(r["id"])
+                kg_context["triples"].append(f"[{r['source_name']}] -> {r['relation_type']} -> [{r['target_name']}]")
+                
+            kg_context["triples"] = list(set(kg_context["triples"]))[:30]
+            
+            obs_ent_query = f"SELECT content FROM observations WHERE entity_id IN ({placeholders_ent})"
+            obs_ent_rows = self.conn.execute(obs_ent_query, ent_ids).fetchall()
+            
+            if rel_ids:
+                placeholders_rel = ",".join(["?"] * len(rel_ids))
+                obs_rel_query = f"SELECT content FROM observations WHERE relation_id IN ({placeholders_rel})"
+                obs_rel_rows = self.conn.execute(obs_rel_query, rel_ids).fetchall()
+            else:
+                obs_rel_rows = []
+                
+            for o in obs_ent_rows + obs_rel_rows:
+                kg_context["observations"].append(o["content"])
+                
+            kg_context["observations"] = list(set(kg_context["observations"]))[:20]
+
+        return kg_context
 
     # ---------- History ----------
 
@@ -661,3 +772,142 @@ class SynapseEngine:
                 self._insert_version(
                     chunk_id, version=1, content=chunk_content, token_count=len(chunk_terms), now=now
                 )
+
+    def _queue_extraction_job(self, memory_id: str, now: datetime) -> None:
+        job_id = new_id()
+        with self.conn:
+            # Remove jobs anteriores pendentes para a mesma memória
+            self.conn.execute(
+                "DELETE FROM indexing_jobs WHERE memory_id=? AND status='pending';", (memory_id,)
+            )
+            self.conn.execute(
+                "INSERT INTO indexing_jobs(id, memory_id, status, attempts, created_at, updated_at) "
+                "VALUES(?, ?, 'pending', 0, ?, ?);",
+                (job_id, memory_id, isoformat_z(now), isoformat_z(now)),
+            )
+
+    def process_indexing_jobs(self, limit: int = 10) -> int:
+        self._require_writable()
+        job_ids = []
+        timeout_dt = isoformat_z(utc_now() - timedelta(minutes=10))
+        with self.conn:
+            query = f"""
+                SELECT id, memory_id, attempts FROM indexing_jobs 
+                WHERE (status IN ('pending', 'failed') AND attempts < 3) 
+                   OR (status = 'processing' AND updated_at < ?)
+                LIMIT {limit};
+            """
+            rows = self.conn.execute(query, (timeout_dt,)).fetchall()
+            for r in rows:
+                self.conn.execute(
+                    "UPDATE indexing_jobs SET status='processing', updated_at=? WHERE id=?", 
+                    (isoformat_z(utc_now()), r["id"])
+                )
+                job_ids.append((r["id"], r["memory_id"], r["attempts"]))
+        
+        if not job_ids:
+            return 0
+            
+        processed_count = 0
+        sys_prompt = self._load_prompt("extract_kg.txt")
+        llm = get_llm_client()
+        
+        for job_id, mem_id, attempts in job_ids:
+            try:
+                mem = self.conn.execute("SELECT content FROM memory WHERE id=?;", (mem_id,)).fetchone()
+                if not mem:
+                    with self.conn:
+                        self.conn.execute("DELETE FROM indexing_jobs WHERE id=?;", (job_id,))
+                    continue
+                
+                content = mem["content"]
+                
+                version_row = self.conn.execute(
+                    "SELECT content FROM memory_version WHERE memory_id=? ORDER BY version DESC LIMIT 1;", 
+                    (mem_id,)
+                ).fetchone()
+                
+                full_content = version_row["content"] if version_row else content
+                
+                raw_res = llm.chat_completion(sys_prompt, full_content)
+                if not raw_res:
+                    raise SynapseError("LLM response is empty")
+                
+                try:
+                    data = json.loads(raw_res)
+                except json.JSONDecodeError:
+                    raise SynapseError("LLM retornou JSON inválido")
+                
+                now = utc_now()
+                with self.conn:
+                    entity_map = {}
+                    for ent in data.get("entities", []):
+                        name = ent.get("name", "").strip()
+                        if not name:
+                            continue
+                        
+                        e_row = self.conn.execute("SELECT id FROM entities WHERE name=?;", (name,)).fetchone()
+                        if e_row:
+                            e_id = e_row["id"]
+                            self.conn.execute("UPDATE entities SET updated_at=? WHERE id=?;", (isoformat_z(now), e_id))
+                        else:
+                            e_id = new_id()
+                            self.conn.execute(
+                                "INSERT INTO entities (id, name, type, description, created_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?);",
+                                (e_id, name, ent.get("type"), ent.get("description"), isoformat_z(now), isoformat_z(now))
+                            )
+                        entity_map[name] = e_id
+                        
+                    for rel in data.get("relations", []):
+                        source = rel.get("source", "").strip()
+                        target = rel.get("target", "").strip()
+                        rel_type = rel.get("type", "").strip()
+                        if not source or not target or not rel_type:
+                            continue
+                        
+                        source_id = entity_map.get(source)
+                        target_id = entity_map.get(target)
+                        if not source_id or not target_id:
+                            continue
+                            
+                        rel_id = new_id()
+                        self.conn.execute(
+                            "INSERT INTO relations (id, source_id, target_id, relation_type, created_at) "
+                            "VALUES (?, ?, ?, ?, ?);",
+                            (rel_id, source_id, target_id, rel_type, isoformat_z(now))
+                        )
+                        
+                        obs = rel.get("observation")
+                        if obs:
+                            self.conn.execute(
+                                "INSERT INTO observations (id, entity_id, relation_id, content, memory_id, created_at) "
+                                "VALUES (?, NULL, ?, ?, ?, ?);",
+                                (new_id(), rel_id, obs, mem_id, isoformat_z(now))
+                            )
+                            
+                    for obs in data.get("observations", []):
+                        target_name = obs.get("target_name", "").strip()
+                        obs_content = obs.get("content", "").strip()
+                        if not target_name or not obs_content:
+                            continue
+                        e_id = entity_map.get(target_name)
+                        if not e_id:
+                            continue
+                            
+                        self.conn.execute(
+                            "INSERT INTO observations (id, entity_id, relation_id, content, memory_id, created_at) "
+                            "VALUES (?, ?, NULL, ?, ?, ?);",
+                            (new_id(), e_id, obs_content, mem_id, isoformat_z(now))
+                        )
+                        
+                    self.conn.execute("UPDATE indexing_jobs SET status='completed', updated_at=? WHERE id=?;", (isoformat_z(now), job_id))
+                    
+                processed_count += 1
+            except Exception as e:
+                print(f"Error processing job {job_id}: {e}")
+                now = utc_now()
+                with self.conn:
+                    self.conn.execute("UPDATE indexing_jobs SET status='failed', attempts=attempts+1, updated_at=? WHERE id=?;", (isoformat_z(now), job_id))
+                    
+        return processed_count
